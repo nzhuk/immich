@@ -94,6 +94,52 @@ class BackgroundWorkerApiImpl: BackgroundWorkerFgHostApi {
   }
   
   /**
+   * Executes the background worker for a Shortcuts action (App Intent) instead of a background task.
+   * This method shares the task semaphore with the background tasks, creates a BackgroundWorker,
+   * and cleanly closes it if the intent is cancelled.
+   *
+   * - Parameters:
+   *   - maxSeconds: Timeout for the operation in seconds
+   * - Returns: Whether the run succeeded, or nil when another background run is already in progress
+   */
+  static func runFromIntent(maxSeconds: Int) async -> Bool? {
+    // Non-blocking acquire, in a synchronous function because semaphore waits are disallowed in async code
+    func tryAcquireTaskSemaphore() -> Bool {
+      return taskSemaphore.wait(timeout: .now()) == .success
+    }
+    guard tryAcquireTaskSemaphore() else { return nil }
+    defer { taskSemaphore.signal() }
+    launchedInBackground = true
+
+    // Keeps the worker reachable from the cancellation handler. Only accessed on the main queue.
+    final class WorkerHolder: @unchecked Sendable {
+      var worker: BackgroundWorker?
+    }
+    let holder = WorkerHolder()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        DispatchQueue.main.async {
+          var resumed = false
+          let finish = { (success: Bool) in
+            guard !resumed else { return }
+            resumed = true
+            continuation.resume(returning: success)
+          }
+          let worker = BackgroundWorker(taskType: .refresh, maxSeconds: maxSeconds, completionHandler: finish)
+          holder.worker = worker
+          worker.run()
+          // Backstop in case Dart never acknowledges the cancel, like the 2s timer in the expiration handler
+          DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(maxSeconds + 3)) {
+            finish(false)
+          }
+        }
+      }
+    } onCancel: {
+      DispatchQueue.main.async { holder.worker?.close() }
+    }
+  }
+
+  /**
    * Executes the background worker within the context of a background task.
    * This method creates a BackgroundWorker, sets up task expiration handling,
    * and manages the synchronization between the background task and the Flutter engine.
